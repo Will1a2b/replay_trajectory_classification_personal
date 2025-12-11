@@ -1,0 +1,29 @@
+name: replay_trajectory_classification
+channels:
+- conda-forge
+- franklab
+- edeno
+dependencies:
+- numpy
+- scipy
+- pandas
+- numba
+- scikit-learn
+- scikit-image
+- joblib
+- seaborn
+- xarray
+- dask
+- distributed
+- regularized_glm
+- tqdm
+- flake8
+- jupyter
+- jupyterlab
+- setuptools
+- ripple_detection
+- loren_frank_data_processing
+- "track_linearization>=2.3.1"
+- pip
+- pip:
+  - 'black[jupyter]'
