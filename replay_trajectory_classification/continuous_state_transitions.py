@@ -106,7 +106,7 @@ def _random_walk_on_track_circ_graph(
     place_bin_centers: np.ndarray,
     movement_mean: float,
     movement_var: float,
-    place_bin_center_ind_to_node: np.ndarray,
+    place_bin_center_ind_to_node: NDArray[np.float64],
     distance_between_nodes: dict[dict],
     track_length: float,
 ) -> np.ndarray:
@@ -122,9 +122,7 @@ def _random_walk_on_track_circ_graph(
     movement_mean : float
     movement_var : float
     place_bin_center_ind_to_node : np.ndarray
-        (Unused for circular walk but kept for API compatibility.)
     distance_between_nodes : dict[dict]
-        (Ignored for circular walk; retained for compatibility.)
     track_length : float
         The total length of the circular track.
 
@@ -138,18 +136,18 @@ def _random_walk_on_track_circ_graph(
     state_transition = np.zeros((n, n))
     gaussian = multivariate_normal(mean=movement_mean, cov=movement_var)
 
-    for i in range(n):
-        for j in range(n):
-
-            # Linear distance between bin centers
-            d = abs(place_bin_centers[j] - place_bin_centers[i])
-
-            # Circular wrap-around distance
-            d_circ = min(d, track_length - d)
-
-            # Gaussian probability of this movement distance
-            state_transition[i, j] = gaussian.pdf(d_circ)
-
+    for bin_ind1, node1 in enumerate(place_bin_center_ind_to_node):
+        for bin_ind2, node2 in enumerate(place_bin_center_ind_to_node):
+            try:
+                d = distance_between_nodes[node1][node2]
+                d_circ = min(d, track_length - d)
+                state_transition[bin_ind1, bin_ind2] = gaussian.pdf(
+                    d_circ
+                )
+            except KeyError:
+                # bins not on track interior will be -1 and not in distance
+                # between nodes
+                continue
     return state_transition
 
 
@@ -167,12 +165,18 @@ class RandomWalk:
     movement_mean : float, optional
     use_diffusion : bool, optional
         Use diffusion to respect the geometry of the environment
+    cir_track_length : float | None
+    If not None, treat the environment as circular and use
+    extended-bin random walk construction. The value itself
+    is not used numerically.
     """
 
     environment_name: str = ""
     movement_var: float = 6.0
     movement_mean: float = 0.0
     use_diffusion: bool = False
+    cir_track_length: float | None = None 
+
 
     def make_state_transition(self, environments: tuple[Environment]) -> NDArray[np.float64]:
         """Creates a transition matrix for a given environment.
@@ -189,7 +193,20 @@ class RandomWalk:
         """
         self.environment = environments[environments.index(self.environment_name)]
 
-        if self.environment.track_graph is None:
+        if self.cir_track_length is not None:
+            place_bin_center_ind_to_node = np.asarray(
+                self.environment.place_bin_centers_nodes_df_.node_id
+            )
+            transition_matrix = _random_walk_on_track_circ_graph(
+            self.environment.place_bin_centers_,
+            self.movement_mean,
+            self.movement_var,
+            place_bin_center_ind_to_node,
+            self.environment.distance_between_nodes_,
+            track_length=max(self.environment.place_bin_edges_),
+        )
+
+        elif self.environment.track_graph is None:
             n_position_dims = self.environment.place_bin_centers_.shape[1]
 
             if (n_position_dims == 1) or not self.use_diffusion:
@@ -398,6 +415,77 @@ class EmpiricalMovement:
 
         return np.linalg.matrix_power(state_transition, self.speedup)
 
+from scipy.stats import norm
+
+def gaussian_rw_from_distance(distance_matrix, movement_var, movement_mean=0.0):
+    gaussian = norm(
+        loc=movement_mean,
+        scale=np.sqrt(movement_var)
+    )
+    return gaussian.pdf(distance_matrix)
+
+
+import numpy as np
+
+
+def build_extended_rw_blocks(
+    bin_centers: np.ndarray,
+    track_length: float,
+    movement_var: float,
+):
+    """
+    Build Gaussian random-walk blocks on an extended circular track.
+
+    Parameters
+    ----------
+    bin_centers : ndarray, shape (N,)
+        Original place-bin centers.
+    track_length : float
+        Full circular track length.
+    movement_var : float
+        Variance of Gaussian movement.
+
+    Returns
+    -------
+    RW_center : ndarray, shape (N, N)
+    RW_left   : ndarray, shape (N, N)
+    RW_right  : ndarray, shape (N, N)
+    """
+
+    centers = np.asarray(bin_centers).ravel()
+    N = centers.size
+    assert N > 1
+
+    # Build extended centers (t+1)
+    centers_ext = np.concatenate([
+        centers - track_length,   # left
+        centers,                  # center
+        centers + track_length,   # right
+    ])  # (3N,)
+
+    # Distance matrix (N, 3N)
+    D_ext = np.abs(
+        centers[:, None] - centers_ext[None, :]
+    )
+    assert D_ext.shape == (N, 3 * N)
+
+    # Gaussian RW
+    RW_ext = gaussian_rw_from_distance(D_ext, movement_var)
+    assert RW_ext.shape == (N, 3 * N)
+
+    # Split columns
+    left   = slice(0, N)
+    center = slice(N, 2 * N)
+    right  = slice(2 * N, 3 * N)
+
+    RW_left   = RW_ext[:, left]
+    RW_center = RW_ext[:, center]
+    RW_right  = RW_ext[:, right]
+
+    return RW_center, RW_left, RW_right
+
+
+
 
 @dataclass
 class RandomWalkDirection1:
@@ -410,10 +498,16 @@ class RandomWalkDirection1:
     movement_var : float, optional
         How far the animal is can move in one time bin during normal
         movement.
+    
+    cir_track_length : float | None
+    If not None, treat the environment as circular and use
+    extended-bin random walk construction. The value itself
+    is not used numerically.
     """
 
     environment_name: str = ""
     movement_var: float = 6.0
+    cir_track_length: float | None = None
 
     def make_state_transition(self, environments: tuple[Environment]):
         """Creates a transition matrix for a given environment.
@@ -429,11 +523,22 @@ class RandomWalkDirection1:
 
         """
         self.environment = environments[environments.index(self.environment_name)]
-        random = RandomWalk(
-            self.environment_name, self.movement_var
-        ).make_state_transition(environments)
+        if self.cir_track_length is not None:
+            RW_center, RW_left, RW_right = \
+            build_extended_rw_blocks(self.environment.place_bin_centers_,
+                                     max(self.environment.place_bin_edges_),
+                                     self.movement_var
+            )
+            RW_clockwise = _normalize_row_probability(np.triu(RW_center) + RW_right)
+        else:
+            random = RandomWalk(
+                self.environment_name, self.movement_var
+            ).make_state_transition(environments)
+            RW_clockwise =_normalize_row_probability(np.triu(random))
 
-        return _normalize_row_probability(np.triu(random))
+        RW_clockwise = np.squeeze(RW_clockwise)
+
+        return RW_clockwise
 
 
 @dataclass
@@ -447,10 +552,15 @@ class RandomWalkDirection2:
     movement_var : float, optional
         How far the animal is can move in one time bin during normal
         movement.
+    cir_track_length : float | None
+    If not None, treat the environment as circular and use
+    extended-bin random walk construction. The value itself
+    is not used numerically.
     """
 
     environment_name: str = ""
     movement_var: float = 6.0
+    cir_track_length: float | None = None
 
     def make_state_transition(self, environments: tuple[Environment]):
         """Creates a transition matrix for a given environment.
@@ -466,8 +576,21 @@ class RandomWalkDirection2:
 
         """
         self.environment = environments[environments.index(self.environment_name)]
-        random = RandomWalk(
-            self.environment_name, self.movement_var
-        ).make_state_transition(environments)
 
-        return _normalize_row_probability(np.tril(random))
+        if self.cir_track_length is not None:
+            RW_center, RW_left, RW_right = \
+            build_extended_rw_blocks(self.environment.place_bin_centers_,
+                                     max(self.environment.place_bin_edges_),
+                                     self.movement_var
+            )
+            RW_anticlockwise = _normalize_row_probability(np.tril(RW_center) + RW_left)
+        else:
+            
+            random = RandomWalk(
+                self.environment_name, self.movement_var,cir_track_length = self.cir_track_length
+            ).make_state_transition(environments)
+            RW_anticlockwise = _normalize_row_probability(np.tril(random))
+        
+        RW_anticlockwise = np.squeeze(RW_anticlockwise)
+
+        return RW_anticlockwise

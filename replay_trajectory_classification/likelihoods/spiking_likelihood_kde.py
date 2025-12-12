@@ -145,7 +145,8 @@ def get_firing_rate(
             position_std,
             block_size=block_size,
         )
-        return np.exp(np.log(mean_rate) + np.log(marginal_density) - np.log(occupancy))
+        eps = 1e-12
+        return np.exp(np.log(mean_rate+eps) + np.log(marginal_density+eps) - np.log(occupancy+eps))
     else:
         return np.zeros_like(occupancy)
 
