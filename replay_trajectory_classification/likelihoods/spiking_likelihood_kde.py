@@ -15,6 +15,8 @@ import pandas as pd
 import xarray as xr
 from scipy.special import xlogy
 from tqdm.auto import tqdm
+import cupy as cp
+
 
 from replay_trajectory_classification.core import atleast_2d
 from replay_trajectory_classification.likelihoods.diffusion import (
@@ -317,16 +319,18 @@ def combined_likelihood(
     conditional_intensity : NDArray[np.float64], shape (n_bins, n_neurons)
 
     """
-    n_time = spikes.shape[0]
-    n_bins = conditional_intensity.shape[0]
-    log_likelihood = np.zeros((n_time, n_bins))
 
-    conditional_intensity = np.clip(conditional_intensity, a_min=1e-15, a_max=None)
+    S = cp.asarray(spikes, dtype=cp.float32)                 # (T, N)
+    CI = cp.asarray(conditional_intensity, dtype=cp.float32) # (B, N)
 
-    for is_spike, ci in zip(tqdm(spikes.T), conditional_intensity.T):
-        log_likelihood += poisson_log_likelihood(is_spike, ci)
+    CI = cp.clip(CI, 1e-15, None)
+    log_CI = cp.log(CI)
 
-    return log_likelihood
+    LL = S @ log_CI.T
+    LL -= cp.sum(CI, axis=1)[None, :]
+
+    return cp.asnumpy(LL)
+
 
 
 def estimate_spiking_likelihood_kde(

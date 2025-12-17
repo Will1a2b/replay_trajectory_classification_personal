@@ -120,8 +120,9 @@ try:
                 position_std,
                 block_size=block_size,
             )
+            eps = 1e-12
             return np.exp(
-                np.log(mean_rate) + np.log(marginal_density) - np.log(occupancy)
+                np.log(mean_rate+eps) + np.log(marginal_density+eps) - np.log(occupancy+eps)
             )
         else:
             return np.zeros_like(occupancy)
@@ -294,22 +295,18 @@ try:
         conditional_intensity : NDArray[np.float64], shape (n_bins, n_neurons)
 
         """
-        n_time = spikes.shape[0]
-        n_bins = conditional_intensity.shape[0]
-        log_likelihood = cp.zeros((n_time, n_bins), dtype=cp.float32)
 
-        conditional_intensity = np.clip(conditional_intensity, a_min=1e-15, a_max=None)
+        S = cp.asarray(spikes, dtype=cp.float32)                 # (T, N)
+        CI = cp.asarray(conditional_intensity, dtype=cp.float32) # (B, N)
 
-        mempool = cp.get_default_memory_pool()
+        CI = cp.clip(CI, 1e-15, None)
+        log_CI = cp.log(CI)
 
-        for is_spike, ci in zip(
-            tqdm(cp.asarray(spikes, dtype=cp.float32).T),
-            cp.asarray(conditional_intensity, dtype=cp.float32).T,
-        ):
-            log_likelihood += poisson_log_likelihood(is_spike, ci)
-            mempool.free_all_blocks()
+        LL = S @ log_CI.T
+        LL -= cp.sum(CI, axis=1)[None, :]
 
-        return cp.asnumpy(log_likelihood)
+        return cp.asnumpy(LL)
+
 
     def estimate_spiking_likelihood_kde_gpu(
         spikes: NDArray[np.float64],

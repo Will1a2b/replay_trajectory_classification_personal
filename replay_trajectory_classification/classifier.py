@@ -1087,7 +1087,7 @@ class SortedSpikesClassifier(_ClassifierBase):
         spikes: NDArray[np.float64],
         time: Optional[NDArray[np.float64]] = None,
         is_compute_acausal: bool = True,
-        use_gpu: bool = False,
+        use_gpu: bool = True,
         state_names: Optional[list[str]] = None,
         store_likelihood: bool = False,
     ) -> xr.Dataset:
