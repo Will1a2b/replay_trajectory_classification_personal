@@ -39,6 +39,9 @@ from replay_trajectory_classification.core import (
     get_centers,
     mask,
     scaled_likelihood,
+    scaled_likelihood_sum,
+    _causal_classify_gpu_cp,
+    _acausal_classify_gpu_cp
 )
 from replay_trajectory_classification.discrete_state_transitions import (
     DiagonalDiscrete,
@@ -539,6 +542,8 @@ class _ClassifierBase(BaseEstimator, ABC):
             .to_numpy()
         )
 
+
+
     def _get_results(
         self,
         likelihood: dict[tuple[str, str], NDArray[np.float64]],
@@ -547,107 +552,253 @@ class _ClassifierBase(BaseEstimator, ABC):
         is_compute_acausal: bool = True,
         use_gpu: bool = False,
         state_names: Optional[list[str]] = None,
+
+        spikes: Optional[np.ndarray] = None,
+        compute_cell_contributions: bool = False,
+        cell_contribution_mode: str = "acausal",  # "acausal" or "causal"
+        eps_ci: float = 1e-15,
     ) -> xr.Dataset:
-        """Computes the causal and acausal posterior after the likelihood has been computed.
-
-        Parameters
-        ----------
-        likelihood : dict[tuple[str, str], NDArray[np.float64]]
-            Dictionary of likelihood arrays keyed by (environment_name, encoding_group)
-        n_time : int
-        time : NDArray[np.float64], optional
-        is_compute_acausal : bool, optional
-        use_gpu : bool, optional
-        state_names : list[str], optional
-
-        Returns
-        -------
-        results : xr.Dataset
-
+        """
+        GPU-resident implementation when use_gpu=True:
+        - likelihood dict contains LOG-likelihood (T,B) with NaN outside track interior
+        - builds scaled likelihood via scaled_likelihood_sum(axis=(1,2))
+        - runs CuPy-native causal + acausal
+        - optionally: session-level leave-one-neuron-out contributions (default: acausal)
         """
         n_states = self.discrete_state_transition_.shape[0]
         results = {}
         dtype = np.float32 if use_gpu else np.float64
 
+        # allocate container for LOG-likelihood (will be scaled later)
         results["likelihood"] = np.full(
-            (n_time, n_states, self.max_pos_bins_, 1), np.nan, dtype=dtype
+            (n_time, n_states, self.max_pos_bins_, 1), np.nan, dtype=np.float64
         )
-        compute_causal = _causal_classify_gpu if use_gpu else _causal_classify
-        compute_acausal = _acausal_classify_gpu if use_gpu else _acausal_classify
 
+        # fill per-state log-likelihood
         for state_ind, obs in enumerate(self.observation_models):
-            likelihood_name = (obs.environment_name, obs.encoding_group)
-            n_bins = likelihood[likelihood_name].shape[1]
-            results["likelihood"][:, state_ind, :n_bins] = likelihood[likelihood_name][
-                ..., np.newaxis
-            ]
+            lk_key = (obs.environment_name, obs.encoding_group)
+            n_bins = likelihood[lk_key].shape[1]
+            results["likelihood"][:, state_ind, :n_bins, 0] = likelihood[lk_key]
 
-        results["likelihood"] = scaled_likelihood(results["likelihood"], axis=(1, 2))
+        # copy log-likelihood BEFORE scaling (needed for spike-masking edits)
+        logL_full = results["likelihood"].copy()  # (T,S,Pall,1) float64 with NaNs
+
+        # scale: log-likelihood -> scaled likelihood over (state,position)
+        results["likelihood"] = scaled_likelihood_sum(results["likelihood"], axis=(1, 2)).astype(dtype)
         results["likelihood"][np.isnan(results["likelihood"])] = 0.0
-
-        n_environments = len(self.environments)
 
         if time is None:
             time = np.arange(n_time)
 
-        if n_environments == 1:
-            logger.info("Estimating causal posterior...")
-            is_track_interior = self.environments[0].is_track_interior_.ravel(order="F")
-            n_position_bins = len(is_track_interior)
-            is_states = np.ones((n_states,), dtype=bool)
-            st_interior_ind = np.ix_(
-                is_states, is_states, is_track_interior, is_track_interior
-            )
+        n_environments = len(self.environments)
+        if n_environments != 1:
+            compute_causal = _causal_classify_gpu if use_gpu else _causal_classify
+            compute_acausal = _acausal_classify_gpu if use_gpu else _acausal_classify
 
-            results["causal_posterior"] = np.full(
-                (n_time, n_states, n_position_bins, 1), np.nan, dtype=dtype
-            )
-            (
-                results["causal_posterior"][:, :, is_track_interior],
-                data_log_likelihood,
-            ) = compute_causal(
-                self.initial_conditions_[:, is_track_interior].astype(dtype),
-                self.continuous_state_transition_[st_interior_ind].astype(dtype),
-                self.discrete_state_transition_.astype(dtype),
-                results["likelihood"][:, :, is_track_interior].astype(dtype),
-            )
-
-            if is_compute_acausal:
-                logger.info("Estimating acausal posterior...")
-
-                results["acausal_posterior"] = np.full(
-                    (n_time, n_states, n_position_bins, 1), np.nan, dtype=dtype
-                )
-                results["acausal_posterior"][:, :, is_track_interior] = compute_acausal(
-                    results["causal_posterior"][:, :, is_track_interior].astype(dtype),
-                    self.continuous_state_transition_[st_interior_ind].astype(dtype),
-                    self.discrete_state_transition_.astype(dtype),
-                )
-
-            return self._convert_results_to_xarray(
-                results, time, state_names, data_log_likelihood
-            )
-
-        else:
-            logger.info("Estimating causal posterior...")
             (results["causal_posterior"], data_log_likelihood) = compute_causal(
                 self.initial_conditions_.astype(dtype),
                 self.continuous_state_transition_.astype(dtype),
                 self.discrete_state_transition_.astype(dtype),
                 results["likelihood"].astype(dtype),
             )
-
             if is_compute_acausal:
-                logger.info("Estimating acausal posterior...")
                 results["acausal_posterior"] = compute_acausal(
                     results["causal_posterior"].astype(dtype),
                     self.continuous_state_transition_.astype(dtype),
                     self.discrete_state_transition_.astype(dtype),
                 )
-
             return self._convert_results_to_xarray_mutienvironment(
                 results, time, state_names, data_log_likelihood
             )
+
+        # ---------- single environment ----------
+        is_track_interior = self.environments[0].is_track_interior_.ravel(order="F")
+        P_all = len(is_track_interior)
+        P_int = int(is_track_interior.sum())
+
+        is_states = np.ones((n_states,), dtype=bool)
+        st_interior_ind = np.ix_(is_states, is_states, is_track_interior, is_track_interior)
+
+        results["causal_posterior"] = np.full((n_time, n_states, P_all, 1), np.nan, dtype=dtype)
+        if is_compute_acausal:
+            results["acausal_posterior"] = np.full((n_time, n_states, P_all, 1), np.nan, dtype=dtype)
+
+        if use_gpu:
+            import cupy as cp
+
+            # upload constants once
+            ic_cp  = cp.asarray(self.initial_conditions_[:, is_track_interior].astype(cp.float32))
+            cst_cp = cp.asarray(self.continuous_state_transition_[st_interior_ind].astype(cp.float32))
+            dst_cp = cp.asarray(self.discrete_state_transition_.astype(cp.float32))
+
+            L_base_cp = cp.asarray(results["likelihood"][:, :, is_track_interior, :].astype(cp.float32))  # (T,S,Pint,1)
+
+            # compute full posteriors on GPU
+            post_c_cp, log_data_ll_cp = _causal_classify_gpu_cp(ic_cp, cst_cp, dst_cp, L_base_cp)
+            results["causal_posterior"][:, :, is_track_interior, :] = cp.asnumpy(post_c_cp)
+
+            data_log_likelihood = float(cp.asnumpy(log_data_ll_cp))
+
+            post_a_cp = None
+            if is_compute_acausal:
+                post_a_cp = _acausal_classify_gpu_cp(post_c_cp, cst_cp, dst_cp)
+                results["acausal_posterior"][:, :, is_track_interior, :] = cp.asnumpy(post_a_cp)
+
+            ds = self._convert_results_to_xarray(results, time, state_names, data_log_likelihood)
+
+            # -------- session-level leave-one-neuron-out contributions (GPU-resident) --------
+            if compute_cell_contributions and (spikes is not None) and hasattr(self, "place_fields_"):
+                spikes_i = np.asarray(spikes, dtype=np.int64)
+                T, U = spikes_i.shape
+                ds = ds.assign_coords(neuron=np.arange(U))
+
+                mode = (cell_contribution_mode or "acausal").lower()
+                if mode not in ("acausal", "causal"):
+                    raise ValueError("cell_contribution_mode must be 'acausal' or 'causal'")
+                if mode == "acausal" and not is_compute_acausal:
+                    mode = "causal"
+
+                # DEFINE METRICS HERE (so it's available even if active is empty)
+                metric_names = ["kl", "tv", "delta_logp_at_map", "entropy_diff"]
+                nM = len(metric_names)
+
+                active = np.flatnonzero(spikes_i.sum(axis=0) > 0)
+                ds = ds.assign_coords(neuron_active=active)
+
+                if active.size == 0:
+                    ds = ds.assign_coords(metric=metric_names)
+                    ds["neuron_time_metrics"] = (("time", "neuron_active", "metric"),
+                                                np.zeros((T, 0, nM), dtype=np.float32))
+                    ds["neuron_contribution"] = ds["neuron_time_metrics"].sel(metric="kl").sum("time")
+                    ds["neuron_contribution"].attrs["mode"] = mode
+                    return ds
+
+                # full posterior on GPU for chosen mode
+                if mode == "acausal" and is_compute_acausal:
+                    post_full_cp = post_a_cp
+                else:
+                    post_full_cp = post_c_cp
+
+                post_full_pos_cp = cp.sum(post_full_cp, axis=1)[:, :, 0]  # (T,Pint)
+
+                metrics_cp = cp.zeros((T, active.size, nM), dtype=cp.float32)
+                xhat_full_cp = cp.argmax(post_full_pos_cp, axis=1)  # (T,)
+
+                # base log-likelihood interior (as float32 on GPU, -inf for masked)
+                logL_int = logL_full[:, :, is_track_interior, 0].astype(np.float32)  # (T,S,Pint)
+                logL_int = np.where(np.isfinite(logL_int), logL_int, -np.inf).astype(np.float32)
+                logL_int_cp = cp.asarray(logL_int)
+
+                # log-lambda per (S,Pint,U) on GPU (place_fields_ are lambda per bin)
+                loglam_SPU = np.empty((n_states, P_int, U), dtype=np.float32)
+                for s, obs in enumerate(self.observation_models):
+                    key = (obs.environment_name, obs.encoding_group)
+                    lam_full = np.asarray(self.place_fields_[key].values, dtype=np.float32)  # (Pall,U)
+                    lam = lam_full[is_track_interior, :]
+                    lam = np.clip(lam, eps_ci, None)
+                    loglam_SPU[s] = np.log(lam).astype(np.float32)
+                loglam_SPU_cp = cp.asarray(loglam_SPU)
+
+                # working likelihood buffer (GPU), start from base scaled likelihood
+                L_work_cp = L_base_cp.copy()
+
+                def _softmax_state_pos_cp(ll_sp):
+                    """
+                    Stable softmax over (state, position) for a single time slice.
+                    Preserves any -inf/NaN mask by assigning exactly 0 mass there.
+                    ll_sp: (S, Pint) cupy array
+                    returns: (S, Pint) cupy array, sums to 1
+                    """
+                    finite = cp.isfinite(ll_sp)
+                    ll = cp.where(finite, ll_sp, -cp.inf)
+
+                    m = cp.max(ll)
+                    if not cp.isfinite(m).item():
+                        out = cp.zeros_like(ll_sp, dtype=cp.float32)
+                        out[finite] = 1.0
+                        out /= cp.sum(out)
+                        return out.astype(cp.float32)
+
+                    e = cp.exp(ll - m)
+                    e[~finite] = 0.0
+                    e += cp.finfo(cp.float32).eps * finite.astype(cp.float32)
+                    return (e / cp.sum(e)).astype(cp.float32)
+
+                eps_post = cp.float32(1e-30)
+
+                for k, neuron_id in enumerate(active):
+                    t_spk = np.flatnonzero(spikes_i[:, neuron_id] > 0)
+                    if t_spk.size == 0:
+                        continue
+
+                    saved = L_work_cp[t_spk].copy()
+
+                    for t0 in t_spk:
+                        n = int(spikes_i[t0, neuron_id])  # usually 1
+                        ll_minus = logL_int_cp[t0] - (n * loglam_SPU_cp[:, :, neuron_id])  # (S,Pint)
+                        L_work_cp[t0, :, :, 0] = _softmax_state_pos_cp(ll_minus)
+
+                    post_m_c_cp, _ = _causal_classify_gpu_cp(ic_cp, cst_cp, dst_cp, L_work_cp)
+                    if mode == "acausal" and is_compute_acausal:
+                        post_m_cp = _acausal_classify_gpu_cp(post_m_c_cp, cst_cp, dst_cp)
+                    else:
+                        post_m_cp = post_m_c_cp
+
+                    post_m_pos_cp = cp.sum(post_m_cp, axis=1)[:, :, 0]  # (T,Pint)
+
+                    kl_t = cp.sum(
+                        post_full_pos_cp * (cp.log(post_full_pos_cp + eps_post) - cp.log(post_m_pos_cp + eps_post)),
+                        axis=1
+                    )
+                    tv_t = 0.5 * cp.sum(cp.abs(post_full_pos_cp - post_m_pos_cp), axis=1)
+
+                    p_map = cp.take_along_axis(post_full_pos_cp, xhat_full_cp[:, None], axis=1)[:, 0]
+                    q_map = cp.take_along_axis(post_m_pos_cp,   xhat_full_cp[:, None], axis=1)[:, 0]
+                    delta_map = cp.log(p_map + eps_post) - cp.log(q_map + eps_post)
+
+                    Hp = -cp.sum(post_full_pos_cp * cp.log(post_full_pos_cp + eps_post), axis=1)
+                    Hq = -cp.sum(post_m_pos_cp   * cp.log(post_m_pos_cp   + eps_post), axis=1)
+                    ent_diff = Hq - Hp
+
+                    metrics_cp[:, k, 0] = kl_t.astype(cp.float32)
+                    metrics_cp[:, k, 1] = tv_t.astype(cp.float32)
+                    metrics_cp[:, k, 2] = delta_map.astype(cp.float32)
+                    metrics_cp[:, k, 3] = ent_diff.astype(cp.float32)
+
+                    L_work_cp[t_spk] = saved  # restore
+
+                metrics_np = cp.asnumpy(metrics_cp)  # (T, n_active, nM)
+
+                ds = ds.assign_coords(metric=metric_names)
+                ds["neuron_time_metrics"] = (("time", "neuron_active", "metric"), metrics_np)
+
+                ds["neuron_contribution"] = ds["neuron_time_metrics"].sel(metric="kl").sum("time")
+                ds["neuron_contribution"].attrs["mode"] = mode
+
+
+            return ds
+
+        # -------- CPU fallback in this GPU-resident version (rarely used) --------
+        compute_causal = _causal_classify
+        compute_acausal = _acausal_classify
+
+        (results["causal_posterior"][:, :, is_track_interior], data_log_likelihood) = compute_causal(
+            self.initial_conditions_[:, is_track_interior].astype(dtype),
+            self.continuous_state_transition_[st_interior_ind].astype(dtype),
+            self.discrete_state_transition_.astype(dtype),
+            results["likelihood"][:, :, is_track_interior].astype(dtype),
+        )
+        if is_compute_acausal:
+            results["acausal_posterior"][:, :, is_track_interior] = compute_acausal(
+                results["causal_posterior"][:, :, is_track_interior].astype(dtype),
+                self.continuous_state_transition_[st_interior_ind].astype(dtype),
+                self.discrete_state_transition_.astype(dtype),
+            )
+
+        ds = self._convert_results_to_xarray(results, time, state_names, data_log_likelihood)
+        return ds
+
+
 
     def _convert_results_to_xarray(
         self,
@@ -1082,15 +1233,19 @@ class SortedSpikesClassifier(_ClassifierBase):
 
         return self
 
+
     def predict(
         self,
-        spikes: NDArray[np.float64],
-        time: Optional[NDArray[np.float64]] = None,
-        is_compute_acausal: bool = True,
-        use_gpu: bool = True,
-        state_names: Optional[list[str]] = None,
-        store_likelihood: bool = False,
+        spikes,
+        time=None,
+        is_compute_acausal=True,
+        use_gpu=True,
+        state_names=None,
+        store_likelihood=False,
+        compute_cell_contribution=False,
+        cell_contribution_mode: str = "acausal",  # NEW
     ) -> xr.Dataset:
+        
         """Predict the probability of spatial position and category from the spikes.
 
         Parameters
@@ -1107,38 +1262,47 @@ class SortedSpikesClassifier(_ClassifierBase):
             Label the discrete states.
         store_likelihood : bool, optional
             Store the likelihood to reuse in next computation.
+        compute_cell_contribution: bool, optional
+            leave-one-neuron-out to compute each neurons contribution to the posterior
+        cell_contribution_modeL str, optional, 
+            "acausal", or "causal" which contribution will be computed, default is "acausal"
 
         Returns
         -------
         results : xarray.Dataset
 
         """
+
         spikes = np.asarray(spikes)
         n_time = spikes.shape[0]
 
-        # likelihood
         logger.info("Estimating likelihood...")
         likelihood = {}
         for (env_name, enc_group), place_fields in self.place_fields_.items():
             env_ind = self.environments.index(env_name)
-            is_track_interior = self.environments[env_ind].is_track_interior_.ravel(
-                order="F"
-            )
+            is_track_interior = self.environments[env_ind].is_track_interior_.ravel(order="F")
             likelihood[(env_name, enc_group)] = _SORTED_SPIKES_ALGORITHMS[
                 self.sorted_spikes_algorithm
-            ][1](spikes, place_fields.values, is_track_interior)
+            ][1](spikes, place_fields.values, is_track_interior)  # log-likelihood w/ NaN mask
+
         if store_likelihood:
             self.likelihood_ = likelihood
 
-        no_spike_time_bins = spikes.sum(axis=1) == 0
-        # ZERO-SPIKE FIX
-        L = likelihood[(env_name, enc_group)]
-        L[no_spike_time_bins,:] = 1.0
-        likelihood[(env_name, enc_group)] = L
+        # no-spike bins: set interior log-likelihood to 0 but keep NaNs outside interior
+        no_spike = spikes.sum(axis=1) == 0
+        for key, LL in likelihood.items():
+            LL = np.asarray(LL)
+            finite = np.isfinite(LL)
+            LL[no_spike] = np.where(finite[no_spike], 0.0, LL[no_spike])
+            likelihood[key] = LL
 
         return self._get_results(
-            likelihood, n_time, time, is_compute_acausal, use_gpu, state_names
+            likelihood, n_time, time, is_compute_acausal, use_gpu, state_names,
+            spikes=spikes,
+            compute_cell_contributions=compute_cell_contribution,
+            cell_contribution_mode=cell_contribution_mode,  # NEW
         )
+
 
 
 class ClusterlessClassifier(_ClassifierBase):

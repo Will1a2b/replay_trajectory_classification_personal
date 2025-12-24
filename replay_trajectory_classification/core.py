@@ -286,21 +286,26 @@ def scaled_likelihood(log_likelihood: NDArray[np.float64], axis: int = 1) -> NDA
     likelihood += np.spacing(1, dtype=likelihood.dtype)
     return likelihood
 
-def scaled_likelihood_sum(log_likelihood: np.ndarray, axis: int = 1) -> np.ndarray:
-    # Replace NaNs with -inf so exp() → 0
-    log_likelihood = np.where(np.isnan(log_likelihood), -np.inf, log_likelihood)
+from typing import Union, Tuple
 
-    # Numerical stability shift
-    max_log = np.max(log_likelihood, axis=axis, keepdims=True)
+def scaled_likelihood_sum(
+    log_likelihood: np.ndarray,
+    axis: Union[int, Tuple[int, ...]] = 1,
+) -> np.ndarray:
+    finite = np.isfinite(log_likelihood)
+    ll = np.where(finite, log_likelihood, -np.inf)
+
+    max_log = np.max(ll, axis=axis, keepdims=True)
     max_log[~np.isfinite(max_log)] = 0.0
 
-    exp_vals = np.exp(log_likelihood - max_log)
-    exp_vals += np.finfo(exp_vals.dtype).eps  # avoid zeros
+    exp_vals = np.exp(ll - max_log)
+    exp_vals[~finite] = 0.0  # keep masked bins at 0
+
+    # avoid exact zeros ONLY on valid bins
+    exp_vals += np.finfo(exp_vals.dtype).eps * finite.astype(exp_vals.dtype)
 
     sum_vals = np.sum(exp_vals, axis=axis, keepdims=True)
-    probabilities = exp_vals / sum_vals
-
-    return probabilities
+    return exp_vals / sum_vals
 
 
 
@@ -579,6 +584,79 @@ try:
             acausal_posterior[k] /= cp.nansum(acausal_posterior[k])
 
         return cp.asnumpy(acausal_posterior)
+    
+    import cupy as cp
+
+    def _causal_classify_gpu_cp(initial_conditions_cp, continuous_state_transition_cp,
+                                discrete_state_transition_cp, likelihood_cp):
+
+        T, S, P, _ = likelihood_cp.shape
+        posterior = cp.zeros_like(likelihood_cp)
+
+        posterior[0] = initial_conditions_cp * likelihood_cp[0]
+        norm = cp.nansum(posterior[0])
+        log_data_likelihood = cp.log(norm)
+        posterior[0] /= norm
+
+        for k in range(1, T):
+            for s_to in range(S):
+                acc = 0.0
+                for s_from in range(S):
+                    acc = acc + (
+                        discrete_state_transition_cp[s_from, s_to]
+                        * continuous_state_transition_cp[s_from, s_to].T
+                        @ posterior[k - 1, s_from]
+                    )
+                posterior[k, s_to] = acc
+
+            posterior[k] *= likelihood_cp[k]
+            norm = cp.nansum(posterior[k])
+            log_data_likelihood += cp.log(norm)
+            posterior[k] /= norm
+
+        return posterior, log_data_likelihood
+
+
+    def _acausal_classify_gpu_cp(causal_posterior_cp, continuous_state_transition_cp,
+                                discrete_state_transition_cp):
+        """CuPy-native acausal smoother: inputs/outputs are cupy arrays; no host<->device copies."""
+
+        T, S, P, _ = causal_posterior_cp.shape
+        acausal = cp.zeros_like(causal_posterior_cp)
+        acausal[-1] = causal_posterior_cp[-1]
+        eps = cp.finfo(cp.float32).eps
+
+        for k in range(T - 2, -1, -1):
+            prior = cp.zeros((S, P, 1), dtype=cp.float32)
+            for s_next in range(S):
+                acc = 0.0
+                for s_curr in range(S):
+                    acc = acc + (
+                        discrete_state_transition_cp[s_curr, s_next]
+                        * continuous_state_transition_cp[s_curr, s_next].T
+                        @ causal_posterior_cp[k, s_curr]
+                    )
+                prior[s_next] = acc
+
+            ratio = cp.exp(cp.log(acausal[k + 1] + eps) - cp.log(prior + eps))
+
+            weights = cp.zeros((S, P, 1), dtype=cp.float32)
+            for s_curr in range(S):
+                acc = 0.0
+                for s_next in range(S):
+                    acc = acc + (
+                        discrete_state_transition_cp[s_curr, s_next]
+                        * continuous_state_transition_cp[s_curr, s_next]
+                        @ ratio[s_next]
+                    )
+                weights[s_curr] = acc
+
+            acausal[k] = weights * causal_posterior_cp[k]
+            acausal[k] /= cp.nansum(acausal[k])
+
+        return acausal
+
+
 
 except ImportError:
     from logging import getLogger
